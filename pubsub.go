@@ -24,6 +24,14 @@ import (
 
 var log = logging.Logger("pubsub-valuestore")
 
+// Pubsub is the minimal subset of the pubsub interface required by the pubsub
+// value store. This way, users can wrap the underlying pubsub implementation
+// without re-exporting/implementing the entire interface.
+type Pubsub interface {
+	RegisterTopicValidator(topic string, val pubsub.Validator, opts ...pubsub.ValidatorOpt) error
+	Join(topic string, opts ...pubsub.TopicOpt) (*pubsub.Topic, error)
+}
+
 type watchGroup struct {
 	// Note: this chan must be buffered, see notifyWatchers
 	listeners map[chan []byte]struct{}
@@ -32,7 +40,7 @@ type watchGroup struct {
 type PubsubValueStore struct {
 	ctx context.Context
 	ds  ds.Datastore
-	ps  *pubsub.PubSub
+	ps  Pubsub
 
 	host  host.Host
 	fetch *fetchProtocol
@@ -72,7 +80,7 @@ func KeyToTopic(key string) string {
 type Option func(*PubsubValueStore) error
 
 // NewPubsubValueStore constructs a new ValueStore that gets and receives records through pubsub.
-func NewPubsubValueStore(ctx context.Context, host host.Host, ps *pubsub.PubSub, validator record.Validator, opts ...Option) (*PubsubValueStore, error) {
+func NewPubsubValueStore(ctx context.Context, host host.Host, ps Pubsub, validator record.Validator, opts ...Option) (*PubsubValueStore, error) {
 	psValueStore := &PubsubValueStore{
 		ctx: ctx,
 
@@ -470,7 +478,7 @@ func (p *PubsubValueStore) handleSubscription(ctx context.Context, ti *topicInfo
 				case <-ctx.Done():
 					return
 				default:
-					log.Errorf("PubsubPeerJoin: error interacting with new peer", err)
+					log.Errorf("PubsubPeerJoin: error interacting with new peer: %s", err)
 				}
 			}
 		}
@@ -516,15 +524,7 @@ func (p *PubsubValueStore) handleNewMsgs(ctx context.Context, sub *pubsub.Subscr
 }
 
 func (p *PubsubValueStore) handleNewPeer(ctx context.Context, peerEvtHandler *pubsub.TopicEventHandler, key string) ([]byte, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	var pid peer.ID
-
-	for {
+	for ctx.Err() == nil {
 		peerEvt, err := peerEvtHandler.NextPeerEvent(ctx)
 		if err != nil {
 			if err != context.Canceled {
@@ -532,13 +532,19 @@ func (p *PubsubValueStore) handleNewPeer(ctx context.Context, peerEvtHandler *pu
 			}
 			return nil, err
 		}
-		if peerEvt.Type == pubsub.PeerJoin {
-			pid = peerEvt.Peer
-			break
-		}
-	}
 
-	return p.fetch.Fetch(ctx, pid, key)
+		if peerEvt.Type != pubsub.PeerJoin {
+			continue
+		}
+
+		pid := peerEvt.Peer
+		value, err := p.fetch.Fetch(ctx, pid, key)
+		if err == nil {
+			return value, nil
+		}
+		log.Debugf("failed to fetch latest pubsub value for key '%s' from peer '%s': %s", key, pid, err)
+	}
+	return nil, ctx.Err()
 }
 
 func (p *PubsubValueStore) notifyWatchers(key string, data []byte) {
